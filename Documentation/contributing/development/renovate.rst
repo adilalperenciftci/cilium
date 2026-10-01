@@ -47,6 +47,33 @@ This approach is based on the `Local platform guide <https://docs.renovatebot.co
 provided by Renovate. See that guide for more details about usage and
 limitations.
 
+The local platform runs on the checked-out tree and leaves the base branch
+empty, so every rule with ``matchBaseBranches: ["!main"]`` matches and every
+rule with ``matchBaseBranches: ["main"]`` does not.
+
+Dry run against the repository
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The ``Renovate`` workflow can run in dry-run mode against cilium/cilium
+itself. Renovate then looks for updates on every branch in
+``baseBranchPatterns``, but creates no branches or PRs and does not edit the
+Dependency Dashboard issue. Only ``main`` may use the workflow's ``renovate``
+environment, so the dry run always uses the configuration on ``main``.
+
+#. Start the workflow from ``main`` with the ``dry_run`` input set, either
+   from the Actions tab or with:
+
+   .. code-block:: shell-session
+
+      gh workflow run renovate.yaml --repo cilium/cilium --ref main -f dry_run=true
+
+#. Open the run and read its job summary. For each base branch it lists how
+   many branches Renovate would have created, the updates it found, and the
+   vulnerability fixes it applied.
+
+The summary does not include the Dependency Dashboard body, because a lookup
+dry run stops before Renovate builds it.
+
 Testing on a fork
 ~~~~~~~~~~~~~~~~~
 

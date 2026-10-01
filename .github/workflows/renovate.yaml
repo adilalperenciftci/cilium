@@ -12,6 +12,10 @@ on:
         type: boolean
         description: "Run Renovate With Debug Log Levels"
         default: true
+      dry_run:
+        type: boolean
+        description: "Log What Renovate Would Do Without Creating Branches Or PRs"
+        default: false
 
 jobs:
   renovate:
@@ -43,6 +47,12 @@ jobs:
         env:
           # default to DEBUG log level, this is always useful
           LOG_LEVEL: ${{ github.event.inputs.renovate_log_level_debug == 'false' && 'INFO' || 'DEBUG' }}
+          # Renovate ignores the empty value outside a dry run
+          RENOVATE_DRY_RUN: ${{ github.event.inputs.dry_run == 'true' && 'lookup' || '' }}
+          # /tmp is the only directory shared with the Renovate container
+          RENOVATE_LOG_FILE: ${{ github.event.inputs.dry_run == 'true' && '/tmp/renovate.log' || '' }}
+          # the summary step parses this format
+          RENOVATE_LOG_FILE_FORMAT: pretty
         with:
           # renovate: datasource=github-releases depName=renovatebot/renovate
           renovate-version: 44.115.13
@@ -51,3 +61,26 @@ jobs:
           configurationFile: .github/renovate.json5
           token: '${{ steps.get_token.outputs.token }}'
           mount-docker-socket: true
+
+      - name: Summarise the dry run
+        if: ${{ always() && github.event.inputs.dry_run == 'true' }}
+        env:
+          LOG: /tmp/renovate.log
+        run: |
+          if [ ! -s "${LOG}" ]; then
+            echo 'Renovate wrote no log file.' >> "${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+          emit() {
+            out=$(grep -oE "$2" "${LOG}" | sort -u || true)
+            printf '### %s\n\n' "$1"
+            printf '%s\n' "${out:-none}" | sed 's/^/    /'
+            printf '\n'
+          }
+          {
+            echo '## Renovate dry run'
+            echo
+            emit 'Branches it would have created' 'Returning [0-9]+ branch\(es\).*'
+            emit 'Updates it found' '[0-9]+ flattened updates found: .*'
+            emit 'Vulnerability fixes it found' 'Setting allowed version .* to fix vulnerability .* in .*'
+          } >> "${GITHUB_STEP_SUMMARY}"
