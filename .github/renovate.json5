@@ -119,6 +119,7 @@
     "rangeStrategy": "replace"
   },
   "osvVulnerabilityAlerts": true,
+  "dependencyDashboardOSVVulnerabilitySummary": "all",
   "labels": [
     "renovate/stop-updating",
     "kind/enhancement",
