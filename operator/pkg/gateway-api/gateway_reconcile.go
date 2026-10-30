@@ -24,6 +24,7 @@ import (
 	controllerruntime "github.com/cilium/cilium/operator/pkg/controller-runtime"
 	"github.com/cilium/cilium/operator/pkg/gateway-api/helpers"
 	"github.com/cilium/cilium/operator/pkg/model/ingestion"
+	modelTranslation "github.com/cilium/cilium/operator/pkg/model/translation"
 	gatewayApiTranslation "github.com/cilium/cilium/operator/pkg/model/translation/gateway-api"
 	ciliumv2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	"github.com/cilium/cilium/pkg/logging/logfields"
@@ -332,7 +333,11 @@ func (r *gatewayReconciler) ensureEnvoyConfig(ctx context.Context, gw *gatewayv1
 	}
 	cec := desired.DeepCopy()
 	_, err := controllerutil.CreateOrPatch(ctx, r.client, cec, func() error {
-		cec.Spec = desired.Spec
+		next := desired.DeepCopy()
+		if err := modelTranslation.RetainExternalAuthFilterTombstones(cec, next); err != nil {
+			return err
+		}
+		cec.Spec = next.Spec
 		setMergedLabelsAndAnnotations(cec, desired)
 		return nil
 	})

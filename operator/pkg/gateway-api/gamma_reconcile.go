@@ -27,6 +27,7 @@ import (
 	"github.com/cilium/cilium/operator/pkg/gateway-api/routechecks"
 	"github.com/cilium/cilium/operator/pkg/model"
 	"github.com/cilium/cilium/operator/pkg/model/ingestion"
+	modelTranslation "github.com/cilium/cilium/operator/pkg/model/translation"
 	ciliumv2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 )
@@ -374,7 +375,11 @@ func (r *gammaReconciler) ensureEndpointSlice(ctx context.Context, desired *disc
 func (r *gammaReconciler) ensureEnvoyConfig(ctx context.Context, desired *ciliumv2.CiliumEnvoyConfig) error {
 	cec := desired.DeepCopy()
 	_, err := controllerutil.CreateOrPatch(ctx, r.client, cec, func() error {
-		cec.Spec = desired.Spec
+		next := desired.DeepCopy()
+		if err := modelTranslation.RetainExternalAuthFilterTombstones(cec, next); err != nil {
+			return err
+		}
+		cec.Spec = next.Spec
 		cec.OwnerReferences = desired.OwnerReferences
 		setMergedLabelsAndAnnotations(cec, desired)
 		return nil

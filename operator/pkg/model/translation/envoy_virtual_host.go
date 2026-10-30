@@ -23,8 +23,10 @@ import (
 	envoy_type_http_v3 "github.com/envoyproxy/go-control-plane/envoy/type/http/v3"
 	envoy_type_matcher_v3 "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
 	envoy_type_v3 "github.com/envoyproxy/go-control-plane/envoy/type/v3"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/durationpb"
+	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 	"k8s.io/utils/ptr"
 
@@ -279,30 +281,26 @@ func getStatefulSession(sp *model.HTTPSessionPersistence) *anypb.Any {
 
 // getTypedPerFilterConfig returns the TypedPerFilterConfig map for a route.
 func getTypedPerFilterConfig(routeAuth *model.HTTPExternalAuthFilter, allAuthFilters []*model.HTTPExternalAuthFilter, routeEPPs []*model.EndpointPicker, allEPPs []*model.EndpointPicker, route model.HTTPRoute, statefulSessionFilterEnabled bool) map[string]*anypb.Any {
-	var activeKey string
+	var activeID string
 	if routeAuth != nil {
-		activeKey = extAuthzFilterKey(routeAuth)
+		activeID = extAuthzFilterID(routeAuth)
 	}
 
 	config := make(map[string]*anypb.Any, len(allAuthFilters))
-	// For each ext_authz filter active on the listener:
-	//   - If this route's ExternalAuth uses that filter's cluster: no entry (enabled by default).
-	//   - Otherwise: disabled via ExtAuthzPerRoute{Disabled: true}.
+	filterNames := extAuthzFilterNames(allAuthFilters)
+	// Explicitly retain the filter selected by this route and disable the other current filters.
+	// The route metadata marker separately gates filters retained by an older connection manager.
 	for _, af := range allAuthFilters {
-		filterKey := extAuthzFilterKey(af)
-		filterName := ExtAuthzFilterName(filterKey)
-		if filterKey == activeKey {
-			// This filter is enabled for this route; no per-route override needed.
-			continue
-		}
-		// Disable this filter for this route.
-		disabled := toAny(&extauthzv3.ExtAuthzPerRoute{
-			Override: &extauthzv3.ExtAuthzPerRoute_Disabled{Disabled: true},
+		filterID := extAuthzFilterID(af)
+		filterName := filterNames[filterID]
+		perRoute := toAny(&extauthzv3.ExtAuthzPerRoute{
+			Override: &extauthzv3.ExtAuthzPerRoute_Disabled{Disabled: filterID != activeID},
 		})
-		config[filterName] = disabled
+		config[filterName] = perRoute
 	}
 
-	// enable only the EPP that this route targets
+	// Explicitly enable only the EPP that this route targets. The HCM filters
+	// default to disabled so removed filters remain inert on older chains.
 	activeEPP := make(map[string]struct{}, len(routeEPPs))
 	for _, epp := range routeEPPs {
 		name := getEPPClusterName(epp)
@@ -310,13 +308,8 @@ func getTypedPerFilterConfig(routeAuth *model.HTTPExternalAuthFilter, allAuthFil
 	}
 	for _, epp := range allEPPs {
 		name := getEPPClusterName(epp)
-		if _, ok := activeEPP[name]; ok {
-			continue // enabled
-		}
-		disabled := toAny(&extprocv3.ExtProcPerRoute{
-			Override: &extprocv3.ExtProcPerRoute_Disabled{Disabled: true},
-		})
-		config[ExtProcFilterName(name)] = disabled
+		_, active := activeEPP[name]
+		config[ExtProcFilterName(name)] = extProcRouteFilterConfig(!active)
 	}
 
 	if route.CORS != nil {
@@ -334,6 +327,18 @@ func getTypedPerFilterConfig(routeAuth *model.HTTPExternalAuthFilter, allAuthFil
 	return config
 }
 
+func extProcRouteFilterConfig(disabled bool) *anypb.Any {
+	filterConfig := &envoy_config_route_v3.FilterConfig{Disabled: disabled}
+	if !disabled {
+		filterConfig.Config = toAny(&extprocv3.ExtProcPerRoute{
+			Override: &extprocv3.ExtProcPerRoute_Overrides{
+				Overrides: &extprocv3.ExtProcOverrides{},
+			},
+		})
+	}
+	return toAny(filterConfig)
+}
+
 // getTypedPerFilterConfigForSyntheticRoute returns the TypedPerFilterConfig map
 // for a route Cilium generates itself rather than one backed by a Service, such
 // as an HTTPS redirect or the 500 served when a rule has no resolvable backend.
@@ -343,6 +348,29 @@ func getTypedPerFilterConfig(routeAuth *model.HTTPExternalAuthFilter, allAuthFil
 // configuration such as CORS and session persistence is retained.
 func getTypedPerFilterConfigForSyntheticRoute(route model.HTTPRoute, allAuthFilters []*model.HTTPExternalAuthFilter, allEPPs []*model.EndpointPicker, statefulSessionFilterEnabled bool) map[string]*anypb.Any {
 	return getTypedPerFilterConfig(nil, allAuthFilters, nil, allEPPs, route, statefulSessionFilterEnabled)
+}
+
+func getExternalAuthRouteMetadata(routeAuth *model.HTTPExternalAuthFilter, allAuthFilters []*model.HTTPExternalAuthFilter) *envoy_config_core_v3.Metadata {
+	if len(allAuthFilters) == 0 {
+		return nil
+	}
+	selectedFilter := extAuthzDisabledFilterID
+	if routeAuth != nil {
+		selectedFilter = extAuthzFilterID(routeAuth)
+	}
+	return externalAuthRouteMetadata(selectedFilter)
+}
+
+func externalAuthRouteMetadata(selectedFilter string) *envoy_config_core_v3.Metadata {
+	return &envoy_config_core_v3.Metadata{
+		FilterMetadata: map[string]*structpb.Struct{
+			extAuthzRouteMetadataFilterName: {
+				Fields: map[string]*structpb.Value{
+					extAuthzMetadataSelectedKey: structpb.NewStringValue(selectedFilter),
+				},
+			},
+		},
+	}
 }
 
 func envoyHTTPSRoutes(httpRoutes []model.HTTPRoute, hostnames []string, hostNameSuffixMatch bool, allAuthFilters []*model.HTTPExternalAuthFilter, allEPPs []*model.EndpointPicker, statefulSessionFilterEnabled bool) []*envoy_config_route_v3.Route {
@@ -371,6 +399,7 @@ func envoyHTTPSRoutes(httpRoutes []model.HTTPRoute, hostnames []string, hostName
 		// always disable session persistence for HTTPS redirects, since Envoy does not route to a backend.
 		r.SessionPersistence = nil
 		route := envoy_config_route_v3.Route{
+			Metadata: getExternalAuthRouteMetadata(nil, allAuthFilters),
 			Match: getRouteMatch(hostnames,
 				hostNameSuffixMatch,
 				hRoutes[0].PathMatch,
@@ -416,8 +445,13 @@ func envoyHTTPRoutes(httpRoutes []model.HTTPRoute, hostnames []string, hostNameS
 			// redirects don't select an upstream backend.
 			r.SessionPersistence = nil
 		}
+		routeAuth := hRoutes[0].ExternalAuth
+		if hRoutes[0].RequestRedirect != nil {
+			routeAuth = nil
+		}
 		routeEPPs := routeEndpointPicker(r)
 		route := envoy_config_route_v3.Route{
+			Metadata: getExternalAuthRouteMetadata(routeAuth, allAuthFilters),
 			Match: getRouteMatch(hostnames,
 				hostNameSuffixMatch,
 				hRoutes[0].PathMatch,
@@ -428,7 +462,7 @@ func envoyHTTPRoutes(httpRoutes []model.HTTPRoute, hostnames []string, hostNameS
 			RequestHeadersToRemove:  getHeadersToRemove(hRoutes[0].RequestHeaderFilter),
 			ResponseHeadersToAdd:    getHeadersToAdd(hRoutes[0].ResponseHeaderModifier),
 			ResponseHeadersToRemove: getHeadersToRemove(hRoutes[0].ResponseHeaderModifier),
-			TypedPerFilterConfig:    getTypedPerFilterConfig(hRoutes[0].ExternalAuth, allAuthFilters, routeEPPs, allEPPs, r, statefulSessionFilterEnabled),
+			TypedPerFilterConfig:    getTypedPerFilterConfig(routeAuth, allAuthFilters, routeEPPs, allEPPs, r, statefulSessionFilterEnabled),
 		}
 
 		if hRoutes[0].RequestRedirect != nil {
@@ -448,10 +482,45 @@ func envoyHTTPRoutes(httpRoutes []model.HTTPRoute, hostnames []string, hostNameS
 				route.ResponseHeadersToRemove = append(route.ResponseHeadersToRemove, getHeadersToRemove(fn.ResponseHeaderModifier)...)
 			}
 		}
-		routes = append(routes, &route)
+		if routeAuth != nil {
+			actual, fallback := externalAuthRouteGate(&route, routeAuth, allAuthFilters, allEPPs, statefulSessionFilterEnabled)
+			routes = append(routes, actual, fallback)
+		} else {
+			routes = append(routes, &route)
+		}
 		delete(matchBackendMap, key)
 	}
 	return routes
+}
+
+func externalAuthRouteGate(route *envoy_config_route_v3.Route, routeAuth *model.HTTPExternalAuthFilter, allAuthFilters []*model.HTTPExternalAuthFilter, allEPPs []*model.EndpointPicker, statefulSessionFilterEnabled bool) (*envoy_config_route_v3.Route, *envoy_config_route_v3.Route) {
+	selectedFilter := extAuthzFilterID(routeAuth)
+	actual := proto.Clone(route).(*envoy_config_route_v3.Route)
+	actual.Match.DynamicMetadata = append(actual.Match.DynamicMetadata, &envoy_type_matcher_v3.MetadataMatcher{
+		Filter: extAuthzDynamicMetadataName,
+		Path: []*envoy_type_matcher_v3.MetadataMatcher_PathSegment{{
+			Segment: &envoy_type_matcher_v3.MetadataMatcher_PathSegment_Key{Key: extAuthzMetadataSelectedKey},
+		}},
+		Value: &envoy_type_matcher_v3.ValueMatcher{
+			MatchPattern: &envoy_type_matcher_v3.ValueMatcher_StringMatch{
+				StringMatch: &envoy_type_matcher_v3.StringMatcher{
+					MatchPattern: &envoy_type_matcher_v3.StringMatcher_Exact{Exact: selectedFilter},
+				},
+			},
+		},
+	})
+
+	fallback := proto.Clone(route).(*envoy_config_route_v3.Route)
+	fallback.Action = &envoy_config_route_v3.Route_DirectResponse{
+		DirectResponse: &envoy_config_route_v3.DirectResponseAction{Status: 503},
+	}
+	fallback.Metadata.FilterMetadata[extAuthzRouteMetadataFilterName].Fields[extAuthzMetadataFallbackKey] = structpb.NewBoolValue(true)
+	fallback.TypedPerFilterConfig = getTypedPerFilterConfigForSyntheticRoute(model.HTTPRoute{}, allAuthFilters, allEPPs, statefulSessionFilterEnabled)
+	fallback.RequestHeadersToAdd = nil
+	fallback.RequestHeadersToRemove = nil
+	fallback.ResponseHeadersToAdd = nil
+	fallback.ResponseHeadersToRemove = nil
+	return actual, fallback
 }
 
 type routeActionMutation func(*envoy_config_route_v3.Route_Route) *envoy_config_route_v3.Route_Route
@@ -733,6 +802,7 @@ func envoyHTTPRouteDirectResponse(route model.HTTPRoute, hostnames []string, hos
 	route.SessionPersistence = nil
 
 	return &envoy_config_route_v3.Route{
+		Metadata: getExternalAuthRouteMetadata(nil, allAuthFilters),
 		Match: getRouteMatch(hostnames,
 			hostNameSuffixMatch,
 			route.PathMatch,

@@ -11,6 +11,7 @@ import (
 	httpCORSv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/cors/v3"
 	extauthzv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ext_authz/v3"
 	extprocv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ext_proc/v3"
+	luav3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/lua/v3"
 	statefulsessionv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/stateful_session/v3"
 	httpConnectionManagerv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	cookiev3 "github.com/envoyproxy/go-control-plane/envoy/extensions/http/stateful_session/cookie/v3"
@@ -191,26 +192,80 @@ func Test_desiredHTTPConnectionManager_withExtAuthz(t *testing.T) {
 	hcm := &httpConnectionManagerv3.HttpConnectionManager{}
 	require.NoError(t, proto.Unmarshal(res.Value, hcm))
 
-	// grpc_web, grpc_stats, ext_authz/grpc, ext_authz/http, router
-	require.Len(t, hcm.GetHttpFilters(), 5)
+	// grpc_web, grpc_stats, route metadata, ext_authz/grpc, ext_authz/http, router
+	require.Len(t, hcm.GetHttpFilters(), 6)
 	require.Equal(t, "envoy.filters.http.grpc_web", hcm.GetHttpFilters()[0].Name)
 	require.Equal(t, "envoy.filters.http.grpc_stats", hcm.GetHttpFilters()[1].Name)
-	require.Equal(t, ExtAuthzFilterName(extAuthzFilterKey(authFilters[0])), hcm.GetHttpFilters()[2].Name)
-	require.Equal(t, ExtAuthzFilterName(extAuthzFilterKey(authFilters[1])), hcm.GetHttpFilters()[3].Name)
-	require.Equal(t, "envoy.filters.http.router", hcm.GetHttpFilters()[4].Name)
+	require.Equal(t, "io.cilium.external_auth.route_metadata", hcm.GetHttpFilters()[2].Name)
+	require.Equal(t, ExtAuthzFilterName(extAuthzFilterKey(authFilters[0])), hcm.GetHttpFilters()[3].Name)
+	require.Equal(t, ExtAuthzFilterName(extAuthzFilterKey(authFilters[1])), hcm.GetHttpFilters()[4].Name)
+	require.Equal(t, "envoy.filters.http.router", hcm.GetHttpFilters()[5].Name)
+
+	routeMetadataFilter := &luav3.Lua{}
+	require.NoError(t, proto.Unmarshal(hcm.GetHttpFilters()[2].GetTypedConfig().Value, routeMetadataFilter))
+	routeMetadataScript := routeMetadataFilter.GetDefaultSourceCode().GetInlineString()
+	require.Contains(t, routeMetadataScript, "local selected_filter = \"!legacy\"", "older route resources must remain authorized during an LDS-first update")
+	require.Contains(t, routeMetadataScript, "local available_filters = {")
+	require.Contains(t, routeMetadataScript, "route_metadata:get(\"selected_filter\")")
+	require.Contains(t, routeMetadataScript, "configured == \"!disabled\" or available_filters[configured]")
+	require.Contains(t, routeMetadataScript, "elseif configured ~= nil then")
+	require.Contains(t, routeMetadataScript, "request_handle:respond({[\":status\"] = \"503\"}, \"\")", "a route selecting a filter absent from a retained listener must stop locally")
+	require.Contains(t, routeMetadataScript, "request_handle:clearRouteCache()", "the selected filter must unlock the authenticated route")
+	for _, authFilter := range authFilters {
+		require.Contains(t, routeMetadataScript, "[\""+testExtAuthzFilterID(authFilter)+"\"] = true")
+	}
+	require.Contains(t, routeMetadataScript, "dynamicMetadata():set")
 
 	// Verify GRPC filter points to the right cluster
 	grpcFilter := &extauthzv3.ExtAuthz{}
-	require.NoError(t, proto.Unmarshal(hcm.GetHttpFilters()[2].GetTypedConfig().Value, grpcFilter))
+	require.NoError(t, proto.Unmarshal(hcm.GetHttpFilters()[3].GetTypedConfig().Value, grpcFilter))
 	require.NotNil(t, grpcFilter.GetGrpcService())
 	require.Equal(t, "grpc:default:grpc-authz:9000", grpcFilter.GetGrpcService().GetEnvoyGrpc().GetClusterName())
 
 	// Verify HTTP filter has path prefix
 	httpFilter := &extauthzv3.ExtAuthz{}
-	require.NoError(t, proto.Unmarshal(hcm.GetHttpFilters()[3].GetTypedConfig().Value, httpFilter))
+	require.NoError(t, proto.Unmarshal(hcm.GetHttpFilters()[4].GetTypedConfig().Value, httpFilter))
 	require.NotNil(t, httpFilter.GetHttpService())
 	require.Equal(t, "/auth", httpFilter.GetHttpService().GetPathPrefix())
 	require.Equal(t, "http:default:http-authz:8080", httpFilter.GetHttpService().GetServerUri().GetCluster())
+}
+
+func TestExternalAuthFilterLifecycle(t *testing.T) {
+	authFilter := &model.HTTPExternalAuthFilter{
+		Backend:               model.Backend{Name: "authz", Namespace: "default", Port: &model.BackendPort{Port: 8080}},
+		Protocol:              model.ExternalAuthProtocolHTTP,
+		AllowedRequestHeaders: []string{"X-Tenant", "Cookie"},
+	}
+	filterName := ExtAuthzFilterName(extAuthzFilterKey(authFilter))
+
+	filter := buildExtAuthzHTTPFilter(authFilter)
+	require.False(t, filter.GetDisabled(), "ExternalAuth filters must remain active for compatibility with older route resources")
+
+	config := &extauthzv3.ExtAuthz{}
+	require.NoError(t, proto.Unmarshal(filter.GetTypedConfig().Value, config))
+	require.Equal(t, "io.cilium.external_auth", config.GetFilterEnabledMetadata().GetFilter())
+	require.Len(t, config.GetFilterEnabledMetadata().GetPath(), 1)
+	require.Equal(t, "selected_filter", config.GetFilterEnabledMetadata().GetPath()[0].GetKey())
+	require.False(t, config.GetFilterEnabledMetadata().GetInvert())
+	require.Equal(t, []string{"!legacy", testExtAuthzFilterID(authFilter)}, extAuthzMetadataMatcherValues(config))
+	require.Equal(t, []string{"Cookie", "X-Tenant"}, []string{
+		config.GetAllowedHeaders().GetPatterns()[0].GetExact(),
+		config.GetAllowedHeaders().GetPatterns()[1].GetExact(),
+	})
+
+	activeConfig := getTypedPerFilterConfig(authFilter, []*model.HTTPExternalAuthFilter{authFilter}, nil, nil, model.HTTPRoute{}, false)
+	activeEntry, ok := activeConfig[filterName]
+	require.True(t, ok, "the authenticated route must explicitly retain its selected filter")
+	activePerRoute := &extauthzv3.ExtAuthzPerRoute{}
+	require.NoError(t, proto.Unmarshal(activeEntry.Value, activePerRoute))
+	require.False(t, activePerRoute.GetDisabled())
+
+	unauthenticatedConfig := getTypedPerFilterConfig(nil, nil, nil, nil, model.HTTPRoute{}, false)
+	require.NotContains(t, unauthenticatedConfig, filterName, "a route without current ExternalAuth filters has no per-filter override")
+
+	reordered := *authFilter
+	reordered.AllowedRequestHeaders = []string{"Cookie", "X-Tenant"}
+	require.True(t, proto.Equal(filter, buildExtAuthzHTTPFilter(&reordered)), "equivalent header sets must emit the same HCM filter")
 }
 
 func Test_buildExtAuthzHTTPFilter_forwardBody(t *testing.T) {
@@ -381,11 +436,13 @@ func Test_getTypedPerFilterConfig(t *testing.T) {
 			Protocol: model.ExternalAuthProtocolGRPC,
 		}
 		cfg := getTypedPerFilterConfig(routeAuth, authFilters, nil, nil, model.HTTPRoute{}, false)
-		// Only svc-b should be disabled; svc-a has no entry (enabled by default)
-		require.Len(t, cfg, 1)
-		_, hasSvcA := cfg["envoy.filters.http.ext_authz/GRPC:ns:svc-a:9000"]
-		require.False(t, hasSvcA, "active auth filter must not be explicitly disabled")
-		disabledEntry, hasSvcB := cfg["envoy.filters.http.ext_authz/HTTP:ns:svc-b:8080"]
+		require.Len(t, cfg, 2)
+		activeEntry, hasSvcA := cfg[ExtAuthzFilterName(extAuthzFilterKey(authFilters[0]))]
+		require.True(t, hasSvcA)
+		activePerRoute := &extauthzv3.ExtAuthzPerRoute{}
+		require.NoError(t, proto.Unmarshal(activeEntry.Value, activePerRoute))
+		require.False(t, activePerRoute.GetDisabled())
+		disabledEntry, hasSvcB := cfg[ExtAuthzFilterName(extAuthzFilterKey(authFilters[1]))]
 		require.True(t, hasSvcB)
 		perRoute := &extauthzv3.ExtAuthzPerRoute{}
 		require.NoError(t, proto.Unmarshal(disabledEntry.Value, perRoute))
@@ -485,6 +542,52 @@ func Test_extAuthzFilterKey_sameBackendDifferentConfig(t *testing.T) {
 	headersAB := &model.HTTPExternalAuthFilter{Backend: backend, Protocol: model.ExternalAuthProtocolHTTP, AllowedRequestHeaders: []string{"A", "B"}}
 	headersBA := &model.HTTPExternalAuthFilter{Backend: backend, Protocol: model.ExternalAuthProtocolHTTP, AllowedRequestHeaders: []string{"B", "A"}}
 	require.Equal(t, extAuthzFilterKey(headersAB), extAuthzFilterKey(headersBA))
+	// Established names remain stable for ordinary configurations.
+	require.Equal(t, "HTTP:ns:authz:9000:pp:/check", extAuthzFilterKey(withPrefix))
+	// Existing filter names must also remain stable when values contain key delimiters.
+	withDelimiters := &model.HTTPExternalAuthFilter{Backend: backend, Protocol: model.ExternalAuthProtocolHTTP, PathPrefix: "/check:tenant,%"}
+	require.Equal(t, "HTTP:ns:authz:9000:pp:/check:tenant,%", extAuthzFilterKey(withDelimiters))
+
+	// Selector IDs remain distinct even when the established filter-name serialization collides.
+	pathContainingBodyTag := &model.HTTPExternalAuthFilter{Backend: backend, Protocol: model.ExternalAuthProtocolHTTP, PathPrefix: "/check:fb:1"}
+	pathAndBody := &model.HTTPExternalAuthFilter{Backend: backend, Protocol: model.ExternalAuthProtocolHTTP, PathPrefix: "/check", ForwardBody: &model.ForwardBodyConfig{MaxSize: 1}}
+	require.Equal(t, extAuthzFilterKey(pathContainingBodyTag), extAuthzFilterKey(pathAndBody))
+	require.NotEqual(t, extAuthzFilterID(pathContainingBodyTag), extAuthzFilterID(pathAndBody))
+
+	m := &model.Model{HTTP: []model.HTTPListener{{Routes: []model.HTTPRoute{
+		{ExternalAuth: pathContainingBodyTag},
+		{ExternalAuth: pathAndBody},
+	}}}}
+	filters := (&cecTranslator{}).getUniqueAuthFilters(m)
+	require.Len(t, filters, 2)
+	names := extAuthzFilterNames(filters)
+	firstName := names[extAuthzFilterID(pathContainingBodyTag)]
+	secondName := names[extAuthzFilterID(pathAndBody)]
+	require.NotEqual(t, firstName, secondName)
+
+	var emittedNames []string
+	for _, filter := range (&cecTranslator{}).getHTTPConnectionManagerHttpFilters(m) {
+		if isExternalAuthFilterName(filter.GetName()) {
+			emittedNames = append(emittedNames, filter.GetName())
+		}
+	}
+	require.ElementsMatch(t, []string{firstName, secondName}, emittedNames)
+	routeConfig := getTypedPerFilterConfig(pathContainingBodyTag, filters, nil, nil, model.HTTPRoute{}, false)
+	require.Contains(t, routeConfig, firstName)
+	require.Contains(t, routeConfig, secondName)
+}
+
+func testExtAuthzFilterID(af *model.HTTPExternalAuthFilter) string {
+	return extAuthzFilterID(af)
+}
+
+func extAuthzMetadataMatcherValues(config *extauthzv3.ExtAuthz) []string {
+	valueMatchers := config.GetFilterEnabledMetadata().GetValue().GetOrMatch().GetValueMatchers()
+	values := make([]string, 0, len(valueMatchers))
+	for _, matcher := range valueMatchers {
+		values = append(values, matcher.GetStringMatch().GetExact())
+	}
+	return values
 }
 
 func Test_desiredHTTPConnectionManagerWithoutGRPCWebTranslation(t *testing.T) {
@@ -541,6 +644,7 @@ func Test_desiredHTTPConnectionManager_withExtProc(t *testing.T) {
 	}
 	eppIdx, ok := idx[filterName]
 	require.True(t, ok, "ext_proc filter %q must be present in the chain", filterName)
+	require.True(t, hcm.GetHttpFilters()[eppIdx].GetDisabled(), "ext_proc must require an explicit route enable")
 	routerIdx, ok := idx["envoy.filters.http.router"]
 	require.True(t, ok)
 	require.Less(t, eppIdx, routerIdx, "ext_proc must run before the router")

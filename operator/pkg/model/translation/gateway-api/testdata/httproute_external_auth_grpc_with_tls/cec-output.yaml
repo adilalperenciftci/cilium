@@ -41,12 +41,47 @@ spec:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.grpc_stats.v3.FilterConfig
                       emitFilterState: true
                       enableUpstreamStats: true
+                  - name: io.cilium.external_auth.route_metadata
+                    typedConfig:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
+                      defaultSourceCode:
+                        inlineString: |-
+                          local available_filters = {
+                            ["NDpHUlBDMjU6ZGVmYXVsdDphdXRoLXNlcnZpY2U6OTAwMTA6MTowMTowMTow"] = true,
+                          }
+
+                          function envoy_on_request(request_handle)
+                            local selected_filter = "!legacy"
+                            local route_metadata = request_handle:metadata()
+                            if route_metadata ~= nil then
+                              local configured = route_metadata:get("selected_filter")
+                              if configured == "!disabled" or available_filters[configured] then
+                                selected_filter = configured
+                              elseif configured ~= nil then
+                                request_handle:respond({[":status"] = "503"}, "")
+                                return
+                              end
+                            end
+                            request_handle:streamInfo():dynamicMetadata():set("io.cilium.external_auth", "selected_filter", selected_filter)
+                            request_handle:clearRouteCache()
+                          end
                   - name: envoy.filters.http.ext_authz/GRPC:default:auth-service:9001
                     typedConfig:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz
                       decoderHeaderMutationRules:
                         disallowExpression:
                           regex: ^(:authority|host|content-length)$
+                      filterEnabledMetadata:
+                        filter: io.cilium.external_auth
+                        path:
+                          - key: selected_filter
+                        value:
+                          orMatch:
+                            valueMatchers:
+                              - stringMatch:
+                                  exact: "!legacy"
+                              - stringMatch:
+                                  exact: NDpHUlBDMjU6ZGVmYXVsdDphdXRoLXNlcnZpY2U6OTAwMTA6MTowMTowMTow
                       grpcService:
                         envoyGrpc:
                           authority: auth-service:9001
@@ -103,11 +138,39 @@ spec:
           name: "*"
           routes:
             - match:
+                dynamicMetadata:
+                  - filter: io.cilium.external_auth
+                    path:
+                      - key: selected_filter
+                    value:
+                      stringMatch:
+                        exact: NDpHUlBDMjU6ZGVmYXVsdDphdXRoLXNlcnZpY2U6OTAwMTA6MTowMTowMTow
                 prefix: /
+              metadata:
+                filterMetadata:
+                  io.cilium.external_auth.route_metadata:
+                    selected_filter: NDpHUlBDMjU6ZGVmYXVsdDphdXRoLXNlcnZpY2U6OTAwMTA6MTowMTowMTow
               route:
                 cluster: default:my-service:8080
                 maxStreamDuration:
                   maxStreamDuration: 0s
+              typedPerFilterConfig:
+                envoy.filters.http.ext_authz/GRPC:default:auth-service:9001:
+                  "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
+                  disabled: false
+            - directResponse:
+                status: 503
+              match:
+                prefix: /
+              metadata:
+                filterMetadata:
+                  io.cilium.external_auth.route_metadata:
+                    generation_fallback: true
+                    selected_filter: NDpHUlBDMjU6ZGVmYXVsdDphdXRoLXNlcnZpY2U6OTAwMTA6MTowMTowMTow
+              typedPerFilterConfig:
+                envoy.filters.http.ext_authz/GRPC:default:auth-service:9001:
+                  "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
+                  disabled: true
     - "@type": type.googleapis.com/envoy.config.cluster.v3.Cluster
       edsClusterConfig:
         serviceName: default/my-service:8080

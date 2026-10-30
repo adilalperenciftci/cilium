@@ -20,6 +20,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 	"k8s.io/utils/ptr"
 
@@ -1221,6 +1222,7 @@ func Test_envoyHTTPRoutes_disablesExtAuthzOnNoBackendResponse(t *testing.T) {
 		res := envoyHTTPRoutes(httpRoutes, []string{"*"}, false, 80, []*model.HTTPExternalAuthFilter{auth}, nil, false)
 		require.Len(t, res, 1)
 		require.Equal(t, uint32(500), res[0].GetDirectResponse().GetStatus())
+		require.Equal(t, "!disabled", externalAuthRouteSelection(res[0]))
 
 		entry, ok := res[0].TypedPerFilterConfig[filterName]
 		require.True(t, ok, "auth filter must be explicitly disabled on the synthetic response")
@@ -1241,6 +1243,7 @@ func Test_envoyHTTPRoutes_disablesExtAuthzOnNoBackendResponse(t *testing.T) {
 
 		res := envoyHTTPRoutes(httpRoutes, []string{"*"}, false, 80, []*model.HTTPExternalAuthFilter{auth}, nil, false)
 		require.Len(t, res, 1)
+		require.Equal(t, "!disabled", externalAuthRouteSelection(res[0]))
 		require.Contains(t, res[0].TypedPerFilterConfig, "envoy.filters.http.cors")
 	})
 
@@ -1254,9 +1257,13 @@ func Test_envoyHTTPRoutes_disablesExtAuthzOnNoBackendResponse(t *testing.T) {
 		}
 
 		res := envoyHTTPRoutes(httpRoutes, []string{"*"}, false, 80, []*model.HTTPExternalAuthFilter{auth}, nil, false)
-		require.Len(t, res, 1)
-		require.NotContains(t, res[0].TypedPerFilterConfig, filterName,
-			"auth filter must stay enabled on a route that reaches a backend")
+		require.Len(t, res, 2)
+		require.Equal(t, testExtAuthzFilterID(auth), externalAuthRouteSelection(res[0]))
+		entry, ok := res[0].TypedPerFilterConfig[filterName]
+		require.True(t, ok, "auth filter must be explicitly enabled on a route that reaches a backend")
+		perRoute := &extauthzv3.ExtAuthzPerRoute{}
+		require.NoError(t, proto.Unmarshal(entry.Value, perRoute))
+		require.False(t, perRoute.GetDisabled())
 	})
 }
 
@@ -1273,11 +1280,12 @@ func Test_envoyHTTPSRoutes_disablesExtAuthzFilters(t *testing.T) {
 
 	result := envoyHTTPSRoutes(routes, []string{"example.com"}, false, authFilters, nil, false)
 	require.Len(t, result, 1)
+	require.Equal(t, "!disabled", externalAuthRouteSelection(result[0]))
 
 	// The redirect route must disable all auth filters so that redirect requests
 	// are not sent to the auth server before being redirected.
 	require.NotNil(t, result[0].TypedPerFilterConfig, "HTTPS redirect route must have TypedPerFilterConfig to disable ext_authz filters")
-	filterName := ExtAuthzFilterName("GRPC:ns:authz:9000")
+	filterName := ExtAuthzFilterName(extAuthzFilterKey(authFilters[0]))
 	entry, ok := result[0].TypedPerFilterConfig[filterName]
 	require.True(t, ok, "expected ext_authz filter to be disabled on redirect route")
 	perRoute := &extauthzv3.ExtAuthzPerRoute{}
@@ -1317,28 +1325,30 @@ func Test_envoyHTTPRoutes_differentAuthFilters(t *testing.T) {
 	}
 
 	res := envoyHTTPRoutes(httpRoutes, []string{"*"}, false, 80, allAuthFilters, nil, false)
-	require.Len(t, res, 2, "routes with different auth filters must not be merged")
+	require.Len(t, res, 4, "routes with different auth filters must not be merged")
 
 	filterNameA := ExtAuthzFilterName(extAuthzFilterKey(authA))
 	filterNameB := ExtAuthzFilterName(extAuthzFilterKey(authB))
 
-	// First route uses authA — authB must be disabled on it, authA must not appear (enabled by default).
+	// First route uses authA — authA must be explicitly enabled and authB disabled.
 	cfgA := res[0].TypedPerFilterConfig
 	require.NotNil(t, cfgA)
-	_, hasA := cfgA[filterNameA]
-	require.False(t, hasA, "authA filter must be active (not disabled) on route 0")
+	perRouteA0 := &extauthzv3.ExtAuthzPerRoute{}
+	require.NoError(t, proto.Unmarshal(cfgA[filterNameA].Value, perRouteA0))
+	require.False(t, perRouteA0.GetDisabled(), "authA filter must be active on route 0")
 	perRouteB0 := &extauthzv3.ExtAuthzPerRoute{}
 	require.NoError(t, proto.Unmarshal(cfgA[filterNameB].Value, perRouteB0))
 	require.True(t, perRouteB0.GetDisabled(), "authB filter must be disabled on route 0")
 
-	// Second route uses authB — authA must be disabled on it, authB must not appear (enabled by default).
-	cfgB := res[1].TypedPerFilterConfig
+	// Second route uses authB — authA must be disabled and authB explicitly enabled.
+	cfgB := res[2].TypedPerFilterConfig
 	require.NotNil(t, cfgB)
 	perRouteA1 := &extauthzv3.ExtAuthzPerRoute{}
 	require.NoError(t, proto.Unmarshal(cfgB[filterNameA].Value, perRouteA1))
 	require.True(t, perRouteA1.GetDisabled(), "authA filter must be disabled on route 1")
-	_, hasB := cfgB[filterNameB]
-	require.False(t, hasB, "authB filter must be active (not disabled) on route 1")
+	perRouteB1 := &extauthzv3.ExtAuthzPerRoute{}
+	require.NoError(t, proto.Unmarshal(cfgB[filterNameB].Value, perRouteB1))
+	require.False(t, perRouteB1.GetDisabled(), "authB filter must be active on route 1")
 }
 
 func Test_envoyHTTPSRoutes_noAuthFilters(t *testing.T) {
@@ -1348,6 +1358,130 @@ func Test_envoyHTTPSRoutes_noAuthFilters(t *testing.T) {
 	result := envoyHTTPSRoutes(routes, []string{"example.com"}, false, nil, nil, false)
 	require.Len(t, result, 1)
 	require.Nil(t, result[0].TypedPerFilterConfig, "redirect route must not set TypedPerFilterConfig when there are no auth filters")
+	require.Nil(t, result[0].Metadata, "route metadata is unnecessary when the listener has no auth filters")
+}
+
+func Test_envoyHTTPRoutes_marksRoutesWithoutExternalAuth(t *testing.T) {
+	auth := &model.HTTPExternalAuthFilter{
+		Backend:  model.Backend{Name: "authz", Namespace: "default", Port: &model.BackendPort{Port: 9000}},
+		Protocol: model.ExternalAuthProtocolHTTP,
+	}
+	routes := []model.HTTPRoute{
+		{
+			PathMatch: model.StringMatch{Prefix: "/"},
+			Backends:  []model.Backend{{Name: "backend", Namespace: "default", Port: &model.BackendPort{Port: 8080}}},
+		},
+	}
+
+	result := envoyHTTPRoutes(routes, []string{"*"}, false, 80, []*model.HTTPExternalAuthFilter{auth}, nil, false)
+	require.Len(t, result, 1)
+	require.Equal(t, "!disabled", externalAuthRouteSelection(result[0]))
+}
+
+func Test_envoyHTTPRoutes_noAuthFilters(t *testing.T) {
+	routes := []model.HTTPRoute{{
+		PathMatch: model.StringMatch{Prefix: "/"},
+		Backends:  []model.Backend{{Name: "backend", Namespace: "default", Port: &model.BackendPort{Port: 8080}}},
+	}}
+
+	result := envoyHTTPRoutes(routes, []string{"*"}, false, 80, nil, nil, false)
+	require.Len(t, result, 1)
+	require.Nil(t, result[0].Metadata, "route metadata is unnecessary when the listener has no auth filters")
+}
+
+func Test_envoyHTTPRoutes_selectsRetainedExternalAuthFilter(t *testing.T) {
+	authA := &model.HTTPExternalAuthFilter{
+		Backend:  model.Backend{Name: "auth-a", Namespace: "default", Port: &model.BackendPort{Port: 8080}},
+		Protocol: model.ExternalAuthProtocolHTTP,
+	}
+	authB := &model.HTTPExternalAuthFilter{
+		Backend:  model.Backend{Name: "auth-b", Namespace: "default", Port: &model.BackendPort{Port: 8080}},
+		Protocol: model.ExternalAuthProtocolHTTP,
+	}
+	routes := []model.HTTPRoute{
+		{
+			PathMatch:    model.StringMatch{Prefix: "/"},
+			ExternalAuth: authB,
+			Backends:     []model.Backend{{Name: "backend", Namespace: "default", Port: &model.BackendPort{Port: 8080}}},
+		},
+	}
+
+	result := envoyHTTPRoutes(routes, []string{"*"}, false, 80, []*model.HTTPExternalAuthFilter{authB}, nil, false)
+	require.Len(t, result, 2)
+	selected := externalAuthRouteSelection(result[0])
+	require.Equal(t, testExtAuthzFilterID(authB), selected)
+
+	configA := &extauthzv3.ExtAuthz{}
+	require.NoError(t, proto.Unmarshal(buildExtAuthzHTTPFilter(authA).GetTypedConfig().Value, configA))
+	require.NotContains(t, extAuthzMetadataMatcherValues(configA), selected, "a retained filter removed from the current RDS must stay inactive")
+
+	configB := &extauthzv3.ExtAuthz{}
+	require.NoError(t, proto.Unmarshal(buildExtAuthzHTTPFilter(authB).GetTypedConfig().Value, configB))
+	require.Contains(t, extAuthzMetadataMatcherValues(configB), selected, "the current route filter must stay active")
+}
+
+func Test_envoyHTTPRoutes_gatesAuthenticatedRouteForPreSelectorHCM(t *testing.T) {
+	auth := &model.HTTPExternalAuthFilter{
+		Backend:  model.Backend{Name: "auth", Namespace: "default", Port: &model.BackendPort{Port: 8080}},
+		Protocol: model.ExternalAuthProtocolHTTP,
+	}
+	epp := &model.EndpointPicker{Name: "epp", Namespace: "default", Port: 9002, FailureMode: "FailClose"}
+	routes := []model.HTTPRoute{{
+		PathMatch:    model.StringMatch{Prefix: "/private"},
+		ExternalAuth: auth,
+		CORS:         &model.HTTPCORSFilter{AllowOrigins: []string{"https://example.com"}},
+		Backends: []model.Backend{{
+			Name: "backend", Namespace: "default", Port: &model.BackendPort{Port: 8080}, EndpointPicker: epp,
+		}},
+	}}
+
+	result := envoyHTTPRoutes(routes, []string{"*"}, false, 80, []*model.HTTPExternalAuthFilter{auth}, []*model.EndpointPicker{epp}, false)
+	require.Len(t, result, 2)
+	sort.Stable(SortableRoute(result))
+	actual, fallback := result[0], result[1]
+	require.Len(t, actual.GetMatch().GetDynamicMetadata(), 1)
+	matcher := actual.GetMatch().GetDynamicMetadata()[0]
+	require.Equal(t, extAuthzDynamicMetadataName, matcher.GetFilter())
+	require.Equal(t, extAuthzMetadataSelectedKey, matcher.GetPath()[0].GetKey())
+	require.Equal(t, extAuthzFilterID(auth), matcher.GetValue().GetStringMatch().GetExact())
+	require.Equal(t, uint32(503), fallback.GetDirectResponse().GetStatus())
+
+	filterName := extAuthzFilterNames([]*model.HTTPExternalAuthFilter{auth})[extAuthzFilterID(auth)]
+	entry := fallback.GetTypedPerFilterConfig()[filterName]
+	require.NotNil(t, entry)
+	perRoute := &extauthzv3.ExtAuthzPerRoute{}
+	require.NoError(t, entry.UnmarshalTo(perRoute))
+	require.True(t, perRoute.GetDisabled())
+	require.NotContains(t, fallback.GetTypedPerFilterConfig(), "envoy.filters.http.cors")
+	extProcEntry := fallback.GetTypedPerFilterConfig()[ExtProcFilterName(getEPPClusterName(epp))]
+	require.NotNil(t, extProcEntry)
+	requireExtProcRouteFilterState(t, extProcEntry, true)
+}
+
+func Test_envoyHTTPRoutes_redirectDisablesExternalAuth(t *testing.T) {
+	scheme := "https"
+	auth := &model.HTTPExternalAuthFilter{
+		Backend:  model.Backend{Name: "auth", Namespace: "default", Port: &model.BackendPort{Port: 8080}},
+		Protocol: model.ExternalAuthProtocolHTTP,
+	}
+	routes := []model.HTTPRoute{{
+		PathMatch:       model.StringMatch{Prefix: "/"},
+		ExternalAuth:    auth,
+		RequestRedirect: &model.HTTPRequestRedirectFilter{Scheme: &scheme},
+	}}
+
+	result := envoyHTTPRoutes(routes, []string{"*"}, false, 80, []*model.HTTPExternalAuthFilter{auth}, nil, false)
+	require.Len(t, result, 1)
+	filterName := extAuthzFilterNames([]*model.HTTPExternalAuthFilter{auth})[extAuthzFilterID(auth)]
+	entry := result[0].GetTypedPerFilterConfig()[filterName]
+	require.NotNil(t, entry)
+	perRoute := &extauthzv3.ExtAuthzPerRoute{}
+	require.NoError(t, entry.UnmarshalTo(perRoute))
+	require.True(t, perRoute.GetDisabled())
+}
+
+func externalAuthRouteSelection(route *envoy_config_route_v3.Route) string {
+	return route.GetMetadata().GetFilterMetadata()["io.cilium.external_auth.route_metadata"].GetFields()["selected_filter"].GetStringValue()
 }
 
 func Test_envoyHTTPSRoutes_statefulSessionDisabled(t *testing.T) {
@@ -1513,8 +1647,9 @@ func Test_envoyHTTPRoutes_extProcPerRoute(t *testing.T) {
 		}}
 		res := envoyHTTPRoutes(httpRoutes, []string{"*"}, false, 80, nil, allEPPs, false)
 		require.Len(t, res, 1)
-		require.NotContains(t, res[0].TypedPerFilterConfig, filterName,
-			"ext_proc must stay enabled on a route that targets the pool")
+		entry, ok := res[0].TypedPerFilterConfig[filterName]
+		require.True(t, ok, "ext_proc must be explicitly enabled on a route that targets the pool")
+		requireExtProcRouteFilterState(t, entry, false)
 	})
 
 	t.Run("route not targeting the pool disables the filter", func(t *testing.T) {
@@ -1527,10 +1662,7 @@ func Test_envoyHTTPRoutes_extProcPerRoute(t *testing.T) {
 
 		entry, ok := res[0].TypedPerFilterConfig[filterName]
 		require.True(t, ok, "ext_proc must be explicitly disabled on a non-inference route")
-		perRoute := &extprocv3.ExtProcPerRoute{}
-		require.NoError(t, proto.Unmarshal(entry.Value, perRoute))
-
-		require.True(t, perRoute.GetDisabled())
+		requireExtProcRouteFilterState(t, entry, true)
 	})
 
 	t.Run("synthetic direct-response route disables the filter even if it declared the pool", func(t *testing.T) {
@@ -1548,10 +1680,23 @@ func Test_envoyHTTPRoutes_extProcPerRoute(t *testing.T) {
 
 		entry, ok := res[0].TypedPerFilterConfig[filterName]
 		require.True(t, ok, "synthetic routes must disable ext_proc regardless of declared backend")
-		perRoute := &extprocv3.ExtProcPerRoute{}
-		require.NoError(t, proto.Unmarshal(entry.Value, perRoute))
-		require.True(t, perRoute.GetDisabled())
+		requireExtProcRouteFilterState(t, entry, true)
 	})
+}
+
+func requireExtProcRouteFilterState(t *testing.T, entry *anypb.Any, disabled bool) {
+	t.Helper()
+	filterConfig := &envoy_config_route_v3.FilterConfig{}
+	require.NoError(t, entry.UnmarshalTo(filterConfig))
+	require.Equal(t, disabled, filterConfig.GetDisabled())
+	if disabled {
+		require.Nil(t, filterConfig.GetConfig())
+		return
+	}
+	perRoute := &extprocv3.ExtProcPerRoute{}
+	require.NoError(t, filterConfig.GetConfig().UnmarshalTo(perRoute))
+	require.NotNil(t, perRoute.GetOverrides())
+	require.NoError(t, perRoute.ValidateAll())
 }
 
 func Test_getRouteAction_inferencePool(t *testing.T) {

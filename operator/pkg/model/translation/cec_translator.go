@@ -443,13 +443,20 @@ func (i *cecTranslator) getUniqueAuthFilters(m *model.Model) []*model.HTTPExtern
 			if r.ExternalAuth == nil {
 				continue
 			}
-			key := extAuthzFilterKey(r.ExternalAuth)
+			key := extAuthzFilterID(r.ExternalAuth)
 			if _, exists := seen[key]; !exists {
 				seen[key] = struct{}{}
 				result = append(result, r.ExternalAuth)
 			}
 		}
 	}
+	sort.Slice(result, func(a, b int) bool {
+		keyA, keyB := extAuthzFilterKey(result[a]), extAuthzFilterKey(result[b])
+		if keyA != keyB {
+			return keyA < keyB
+		}
+		return extAuthzFilterID(result[a]) < extAuthzFilterID(result[b])
+	})
 	return result
 }
 

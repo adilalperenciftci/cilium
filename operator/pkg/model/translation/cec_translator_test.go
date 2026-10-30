@@ -648,6 +648,14 @@ func TestSharedIngressTranslator_getEnvoyHTTPRouteConfiguration(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			for _, routeConfig := range tt.expectedRouteConfigs {
+				for _, virtualHost := range routeConfig.VirtualHosts {
+					for _, route := range virtualHost.Routes {
+						route.Metadata = getExternalAuthRouteMetadata(nil, nil)
+					}
+				}
+			}
+
 			res, err := defT.desiredEnvoyHTTPRouteConfiguration(tt.args.m)
 			require.NoError(t, err)
 			require.Len(t, res, len(tt.expectedRouteConfigs), "Number of Listeners did not match")
@@ -880,4 +888,23 @@ func Test_getUniqueAuthFilters(t *testing.T) {
 		result := i.getUniqueAuthFilters(m)
 		require.Len(t, result, 1)
 	})
+
+	t.Run("filter order is independent of route order", func(t *testing.T) {
+		afA := &model.HTTPExternalAuthFilter{Backend: backend, Protocol: model.ExternalAuthProtocolHTTP, PathPrefix: "/a"}
+		afB := &model.HTTPExternalAuthFilter{Backend: backend, Protocol: model.ExternalAuthProtocolHTTP, PathPrefix: "/b"}
+		modelAB := &model.Model{HTTP: []model.HTTPListener{{Routes: []model.HTTPRoute{
+			{ExternalAuth: afA},
+			{ExternalAuth: afB},
+		}}}}
+		modelBA := &model.Model{HTTP: []model.HTTPListener{{Routes: []model.HTTPRoute{
+			{ExternalAuth: afB},
+			{ExternalAuth: afA},
+		}}}}
+
+		resultAB := i.getUniqueAuthFilters(modelAB)
+		resultBA := i.getUniqueAuthFilters(modelBA)
+		require.Equal(t, []*model.HTTPExternalAuthFilter{afA, afB}, resultAB)
+		require.Equal(t, []*model.HTTPExternalAuthFilter{afA, afB}, resultBA)
+	})
+
 }
